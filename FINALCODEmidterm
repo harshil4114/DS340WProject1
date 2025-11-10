@@ -1,0 +1,137 @@
+# CREDIT RISK (XGBoost + Optuna + SHAP, Colab-Safe) 
+import warnings, json, numpy as np, pandas as pd, matplotlib.pyplot as plt
+warnings.filterwarnings("ignore")
+
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, RocCurveDisplay, ConfusionMatrixDisplay, confusion_matrix
+)
+
+import xgboost as xgb
+import shap, optuna
+
+plt.rcParams["figure.figsize"] = (6, 4)
+plt.rcParams["figure.dpi"] = 100
+
+RAW_CSV = "/content/foia-7a-fy2020-present-asof-250630.csv"
+TEST_SIZE = 0.2
+SEED = 42
+N_SAMPLES_CAP = 20000
+
+# ---------- CLEANING ----------
+def prep_foia_dataset(input_csv: str) -> pd.DataFrame:
+    usecols = ["LoanStatus","Term","GrossApproval","SBAGuaranteedApproval",
+               "JobsSupported","ApprovalDate","NAICSCode","BorrZip",
+               "UrbanRural","BusinessType","LoanDeliveryMethod","FranchiseCode",
+               "NonProfit","BorrState"]
+    df = pd.read_csv(input_csv, low_memory=False, dtype=str, usecols=lambda x: x in usecols)
+    df = df[df["LoanStatus"].isin(["PIF", "CHGOFF"])].copy()
+    df["Risk"] = (df["LoanStatus"] == "CHGOFF").astype(int)
+    def _to_num(s): return pd.to_numeric(s.str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce")
+    for col in ["Term","GrossApproval","SBAGuaranteedApproval","JobsSupported"]:
+        if col in df.columns: df[col] = _to_num(df[col].astype(str))
+    if "ApprovalDate" in df.columns:
+        df["ApprovalDate"] = pd.to_datetime(df["ApprovalDate"], errors="coerce")
+        df["ApprovalYear"] = df["ApprovalDate"].dt.year
+        df["ApprovalMonth"] = df["ApprovalDate"].dt.month
+    if {"SBAGuaranteedApproval","GrossApproval"}.issubset(df.columns):
+        df["sba_share"] = df["SBAGuaranteedApproval"] / df["GrossApproval"]
+    if "NAICSCode" in df.columns: df["NAICS2"] = df["NAICSCode"].astype(str).str[:2]
+    if "BorrZip" in df.columns: df["Zip3"] = df["BorrZip"].astype(str).str.extract(r"^(\d{3})")
+    for col in ["UrbanRural","BusinessType","LoanDeliveryMethod","FranchiseCode",
+                "NonProfit","BorrState","Zip3","NAICS2"]:
+        if col in df.columns: df[col] = df[col].astype("category")
+    df = df.drop(columns=["LoanStatus"], errors="ignore")
+    df = df.dropna(subset=["Risk"])
+    if len(df) > N_SAMPLES_CAP: df = df.sample(N_SAMPLES_CAP, random_state=SEED)
+    print(f"✅ Cleaned in memory: {len(df):,} rows, {df.shape[1]} features")
+    return df
+
+df_clean = prep_foia_dataset(RAW_CSV)
+y = df_clean["Risk"].astype(int)
+X = df_clean.drop(columns=["Risk"])
+
+cat_cols = X.select_dtypes(include=["object","category"]).columns.tolist()
+num_cols = X.select_dtypes(include=[np.number,"bool"]).columns.tolist()
+
+try:
+    ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+except TypeError:
+    ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+pre = ColumnTransformer([
+    ("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("scl", StandardScaler())]), num_cols),
+    ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("ohe", ohe)]), cat_cols)
+])
+
+# OPTUNA TUNING 
+def objective(trial):
+    params = {
+        "max_depth": trial.suggest_int("max_depth", 3, 8),
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+        "n_estimators": trial.suggest_int("n_estimators", 100, 400),
+        "reg_lambda": trial.suggest_float("reg_lambda", 0.5, 5.0, log=True),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 1.0, log=True),
+        "eval_metric": "logloss",
+        "use_label_encoder": False,
+        "random_state": SEED,
+        "tree_method": "hist",
+        "base_score": 0.5,  # avoid SHAP base_score crash
+    }
+    model = xgb.XGBClassifier(**params)
+    pipe = Pipeline([("pre", pre), ("clf", model)])
+    X_train, X_val, y_train, y_val = train_test_split(X, y, stratify=y, test_size=0.2, random_state=SEED)
+    pipe.fit(X_train, y_train)
+    preds = pipe.predict_proba(X_val)[:, 1]
+    return roc_auc_score(y_val, preds)
+
+print("🔍 Running Optuna hyperparameter tuning (8 trials)...")
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=8, show_progress_bar=False)
+best_params = study.best_params
+print("✅ Best parameters:", best_params)
+
+
+# ---------- TRAIN FINAL MODEL ----------
+final_model = xgb.XGBClassifier(**best_params, use_label_encoder=False, eval_metric="logloss")
+pipe = Pipeline([("pre", pre), ("clf", final_model)])
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=TEST_SIZE, random_state=SEED)
+pipe.fit(X_train, y_train)
+
+# ---------- EVALUATION ----------
+def evaluate_and_plot(model, X_test, y_test):
+    y_pred = model.predict(X_test)
+    y_score = model.predict_proba(X_test)[:, 1]
+    metrics = {
+        "accuracy": accuracy_score(y_test, y_pred),
+        "precision": precision_score(y_test, y_pred),
+        "recall": recall_score(y_test, y_pred),
+        "f1": f1_score(y_test, y_pred),
+        "roc_auc": roc_auc_score(y_test, y_score)
+    }
+    RocCurveDisplay.from_predictions(y_test, y_score)
+    plt.title("ROC Curve (XGBoost)")
+    plt.show()
+    ConfusionMatrixDisplay(confusion_matrix(y_test, y_pred)).plot(values_format="d")
+    plt.title("Confusion Matrix")
+    plt.show()
+    return metrics
+
+metrics = evaluate_and_plot(pipe, X_test, y_test)
+print("\n=== RESULTS ===")
+print(json.dumps(metrics, indent=2))
+
+#SHAP EXPLAINABILITY 
+print("\n📊 Generating SHAP feature importances...")
+explainer = shap.TreeExplainer(final_model)
+X_trans = pre.fit_transform(X_train)
+shap_values = explainer.shap_values(X_trans)
+shap.summary_plot(shap_values, X_trans, plot_type="bar", show=True)
