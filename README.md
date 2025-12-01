@@ -1,5 +1,6 @@
-## DS340W Project 
+## DS340W Project Credit and LoanRisk Prediction
 DS340W – Data Science Capstone Project
+Name - Credit and Loan Risk Prediction
 Instructor: Professor Kaamran Raahemifar
 Authors: Harshil Shinde & Samarth Patel
 
